@@ -4,7 +4,7 @@ from io import BytesIO
 
 from django.db.models import Sum
 from django.http import FileResponse
-from django.shortcuts import get_object_or_404
+from django.shortcuts import get_object_or_404, redirect
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema, OpenApiParameter
 from drf_spectacular.types import OpenApiTypes
@@ -449,3 +449,285 @@ class POSWebhookView(BaseWebhookView):
 
 class PaymentGatewayWebhookView(BaseWebhookView):
 	source = WebhookEvent.WebhookSource.PAYMENT_GATEWAY
+
+
+# PayPal Payment Views
+class PayPalCreatePaymentView(APIView):
+	"""Create a PayPal payment for an invoice"""
+	permission_classes = [permissions.IsAuthenticated]
+
+	@extend_schema(
+		request={
+			"application/json": {
+				"type": "object",
+				"properties": {
+					"invoice_id": {"type": "integer", "description": "Invoice ID to create payment for"}
+				},
+				"required": ["invoice_id"]
+			}
+		},
+		responses={
+			200: {
+				"type": "object",
+				"properties": {
+					"success": {"type": "boolean"},
+					"payment_id": {"type": "string"},
+					"approval_url": {"type": "string"},
+					"status": {"type": "string"}
+				}
+			}
+		},
+		description="Create a PayPal payment for an invoice. Returns approval URL to redirect user."
+	)
+	def post(self, request):
+		from .paypal_service import PayPalService
+		
+		invoice_id = request.data.get("invoice_id")
+		if not invoice_id:
+			return Response(
+				{"error": "invoice_id is required"},
+				status=status.HTTP_400_BAD_REQUEST
+			)
+		
+		try:
+			invoice = Invoice.objects.get(pk=invoice_id)
+		except Invoice.DoesNotExist:
+			return Response(
+				{"error": "Invoice not found"},
+				status=status.HTTP_404_NOT_FOUND
+			)
+		
+		# Check if invoice has balance due
+		if invoice.balance_due <= 0:
+			return Response(
+				{"error": "Invoice is already paid"},
+				status=status.HTTP_400_BAD_REQUEST
+			)
+		
+		# Create PayPal payment
+		paypal_service = PayPalService()
+		result = paypal_service.create_payment(invoice)
+		
+		if result["success"]:
+			return Response(result, status=status.HTTP_200_OK)
+		else:
+			return Response(
+				{"error": "Failed to create PayPal payment", "details": result.get("error")},
+				status=status.HTTP_500_INTERNAL_SERVER_ERROR
+			)
+
+
+class PayPalExecutePaymentView(APIView):
+	"""Execute a PayPal payment after user approval"""
+	permission_classes = [permissions.AllowAny]  # PayPal redirects here
+	
+	@extend_schema(
+		parameters=[
+			OpenApiParameter(
+				name="paymentId",
+				type=OpenApiTypes.STR,
+				location=OpenApiParameter.QUERY,
+				description="PayPal payment ID",
+				required=True
+			),
+			OpenApiParameter(
+				name="PayerID",
+				type=OpenApiTypes.STR,
+				location=OpenApiParameter.QUERY,
+				description="PayPal payer ID",
+				required=True
+			)
+		],
+		responses={
+			200: {
+				"type": "object",
+				"properties": {
+					"success": {"type": "boolean"},
+					"message": {"type": "string"},
+					"payment_id": {"type": "integer"},
+					"invoice_id": {"type": "integer"}
+				}
+			}
+		},
+		description="Execute PayPal payment after user approval (called by PayPal redirect)"
+	)
+	def get(self, request):
+		from .paypal_service import PayPalService
+		from .serializers import PaymentSerializer
+		
+		payment_id = request.query_params.get("paymentId")
+		payer_id = request.query_params.get("PayerID")
+		
+		if not payment_id or not payer_id:
+			return Response(
+				{"error": "paymentId and PayerID are required"},
+				status=status.HTTP_400_BAD_REQUEST
+			)
+		
+		# Execute payment
+		paypal_service = PayPalService()
+		result = paypal_service.execute_payment(payment_id, payer_id)
+		
+		if not result["success"]:
+			return Response(
+				{"error": "Failed to execute payment", "details": result.get("error")},
+				status=status.HTTP_500_INTERNAL_SERVER_ERROR
+			)
+		
+		# Get invoice
+		invoice_id = result.get("invoice_id")
+		if not invoice_id:
+			return Response(
+				{"error": "Invoice ID not found in payment"},
+				status=status.HTTP_400_BAD_REQUEST
+			)
+		
+		try:
+			invoice = Invoice.objects.get(pk=invoice_id)
+		except Invoice.DoesNotExist:
+			return Response(
+				{"error": "Invoice not found"},
+				status=status.HTTP_404_NOT_FOUND
+			)
+		
+		# Get or create PayPal payment method
+		payment_method, _ = PaymentMethod.objects.get_or_create(
+			name="PayPal",
+			defaults={"is_active": True}
+		)
+		
+		# Create payment record
+		payment = Payment.objects.create(
+			invoice=invoice,
+			payment_method=payment_method,
+			amount=result["amount"],
+			reference=result.get("transaction_id", payment_id),
+			status=Payment.PaymentStatus.POSTED,
+			notes=f"PayPal payment ID: {payment_id}, Payer email: {result.get('payer_email', 'N/A')}"
+		)
+		
+		# Update invoice status
+		invoice.recalculate_totals()
+		if invoice.balance_due <= 0:
+			invoice.status = Invoice.InvoiceStatus.PAID
+			invoice.save(update_fields=["status", "updated_at"])
+		
+		return Response({
+			"success": True,
+			"message": "Payment completed successfully",
+			"payment_id": payment.id,
+			"invoice_id": invoice.id,
+			"invoice_number": invoice.invoice_number,
+			"amount_paid": str(payment.amount),
+			"balance_due": str(invoice.balance_due)
+		}, status=status.HTTP_200_OK)
+
+
+class PayPalCancelPaymentView(APIView):
+	"""Handle PayPal payment cancellation"""
+	permission_classes = [permissions.AllowAny]
+	
+	@extend_schema(
+		description="Handle PayPal payment cancellation (called by PayPal redirect)"
+	)
+	def get(self, request):
+		return Response({
+			"message": "Payment cancelled by user"
+		}, status=status.HTTP_200_OK)
+
+
+class PayPalRefundView(APIView):
+	"""Refund a PayPal payment"""
+	permission_classes = [permissions.IsAuthenticated]
+	
+	@extend_schema(
+		request={
+			"application/json": {
+				"type": "object",
+				"properties": {
+					"payment_id": {"type": "integer", "description": "Payment ID to refund"},
+					"amount": {"type": "number", "description": "Amount to refund (optional, full refund if not provided)"},
+					"reason": {"type": "string", "description": "Refund reason"}
+				},
+				"required": ["payment_id"]
+			}
+		},
+		responses={200: {"type": "object"}},
+		description="Refund a PayPal payment (full or partial)"
+	)
+	def post(self, request):
+		from .paypal_service import PayPalService
+		
+		payment_id = request.data.get("payment_id")
+		amount = request.data.get("amount")
+		reason = request.data.get("reason", "")
+		
+		if not payment_id:
+			return Response(
+				{"error": "payment_id is required"},
+				status=status.HTTP_400_BAD_REQUEST
+			)
+		
+		try:
+			payment = Payment.objects.get(pk=payment_id)
+		except Payment.DoesNotExist:
+			return Response(
+				{"error": "Payment not found"},
+				status=status.HTTP_404_NOT_FOUND
+			)
+		
+		# Check if payment is via PayPal
+		if payment.payment_method.name != "PayPal":
+			return Response(
+				{"error": "Payment is not via PayPal"},
+				status=status.HTTP_400_BAD_REQUEST
+			)
+		
+		# Check if already refunded
+		if payment.status == Payment.PaymentStatus.REFUNDED:
+			return Response(
+				{"error": "Payment is already refunded"},
+				status=status.HTTP_400_BAD_REQUEST
+			)
+		
+		# Extract PayPal transaction ID from reference
+		transaction_id = payment.reference
+		
+		# Process refund
+		paypal_service = PayPalService()
+		if amount:
+			amount = Decimal(amount)
+			result = paypal_service.refund_payment(transaction_id, amount)
+		else:
+			amount = payment.amount
+			result = paypal_service.refund_payment(transaction_id)
+		
+		if not result["success"]:
+			return Response(
+				{"error": "Failed to process refund", "details": result.get("error")},
+				status=status.HTTP_500_INTERNAL_SERVER_ERROR
+			)
+		
+		# Create refund record
+		refund = PaymentRefund.objects.create(
+			payment=payment,
+			amount=amount,
+			reason=reason,
+			processed_by=request.user,
+			notes=f"PayPal refund ID: {result.get('refund_id', 'N/A')}"
+		)
+		
+		# Update payment status
+		payment.status = Payment.PaymentStatus.REFUNDED
+		payment.save(update_fields=["status", "updated_at"])
+		
+		# Recalculate invoice
+		payment.invoice.recalculate_totals()
+		
+		return Response({
+			"success": True,
+			"message": "Refund processed successfully",
+			"refund_id": refund.id,
+			"amount": str(refund.amount),
+			"paypal_refund_id": result.get("refund_id")
+		}, status=status.HTTP_200_OK)

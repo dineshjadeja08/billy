@@ -162,6 +162,13 @@ SIMPLE_JWT = {
 
 CORS_ALLOW_ALL_ORIGINS = True
 
+# PayPal Configuration
+PAYPAL_MODE = "sandbox"  # Change to "live" for production
+PAYPAL_CLIENT_ID = "AVAm9Jrm2l4PvsQIQMfsVVyIBBEuXOnAnfJexXfxVgd3vpde4fz-zYQFb6noLUT3cI9Vg4KJ3UbGL9BE"  # Get from PayPal Developer Dashboard
+PAYPAL_CLIENT_SECRET = "EIoS-bG7O1AHWahm9N8gXRImPtdhS0TONaRpo2xLSKAj4yyUwHz5dMwKWAzQyX7x2mPtvSkYsbl6L4dq"  # Get from PayPal Developer Dashboard
+PAYPAL_RETURN_URL = "http://127.0.0.1:8000/api/payments/paypal/success"
+PAYPAL_CANCEL_URL = "http://127.0.0.1:8000/api/payments/paypal/cancel"
+
 # Default primary key field type
 
 # Default primary key field type

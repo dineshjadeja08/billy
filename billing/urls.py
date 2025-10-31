@@ -17,6 +17,10 @@ from .views import (
     ReservationViewSet,
     TaxRuleViewSet,
     TaxSummaryReportView,
+    PayPalCreatePaymentView,
+    PayPalExecutePaymentView,
+    PayPalCancelPaymentView,
+    PayPalRefundView,
 )
 
 router = DefaultRouter()
@@ -38,4 +42,9 @@ urlpatterns = [
     path("webhooks/pms", PMSWebhookView.as_view(), name="webhooks-pms"),
     path("webhooks/pos", POSWebhookView.as_view(), name="webhooks-pos"),
     path("webhooks/payment-gateway", PaymentGatewayWebhookView.as_view(), name="webhooks-payment"),
+    # PayPal payment endpoints
+    path("payments/paypal/create", PayPalCreatePaymentView.as_view(), name="paypal-create"),
+    path("payments/paypal/execute", PayPalExecutePaymentView.as_view(), name="paypal-execute"),
+    path("payments/paypal/cancel", PayPalCancelPaymentView.as_view(), name="paypal-cancel"),
+    path("payments/paypal/refund", PayPalRefundView.as_view(), name="paypal-refund"),
 ]
